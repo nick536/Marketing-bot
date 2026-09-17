@@ -1,0 +1,273 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "demo-app.fullname" . }}
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+spec:
+  {{- if not (and .Values.autoscaling (hasKey .Values.autoscaling "enabled") .Values.autoscaling.enabled) }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "demo-app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "demo-app.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "demo-app.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- $awsSecretsEnabled := and .Values.awsSecretsCSI (hasKey .Values.awsSecretsCSI "enabled") .Values.awsSecretsCSI.enabled }}
+      {{- $awsEnvEnabled := and .Values.awsEnvSecret (hasKey .Values.awsEnvSecret "enabled") .Values.awsEnvSecret.enabled }}
+      {{- /* Derive yamlExtract settings with defaults — enabled by default when awsSecretsCSI is enabled */ -}}
+      {{- $yamlExtractEnabled := $awsSecretsEnabled }}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.yamlExtract (hasKey .Values.awsSecretsCSI.yamlExtract "enabled") }}
+        {{- $yamlExtractEnabled = .Values.awsSecretsCSI.yamlExtract.enabled }}
+      {{- end }}
+      {{- /* Derive yamlKey from envPrefix: prod→production, staging→staging, etc. */ -}}
+      {{- $secretsEnvPrefix := "prod" }}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.envPrefix }}
+        {{- $secretsEnvPrefix = .Values.awsSecretsCSI.envPrefix }}
+      {{- end }}
+      {{- $yamlKey := $secretsEnvPrefix }}
+      {{- if eq $secretsEnvPrefix "prod" }}
+        {{- $yamlKey = "production" }}
+      {{- end }}
+      {{- /* Allow explicit override via yamlExtract.key */ -}}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.yamlExtract .Values.awsSecretsCSI.yamlExtract.key }}
+        {{- $yamlKey = .Values.awsSecretsCSI.yamlExtract.key }}
+      {{- end }}
+      {{- $yamlOutputFile := "database.yml" }}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.yamlExtract .Values.awsSecretsCSI.yamlExtract.outputFile }}
+        {{- $yamlOutputFile = .Values.awsSecretsCSI.yamlExtract.outputFile }}
+      {{- end }}
+      {{- $secretsMountPath := "/app/config" }}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.mountPath }}
+        {{- $secretsMountPath = .Values.awsSecretsCSI.mountPath }}
+      {{- end }}
+      {{- $secretsAlias := printf "%s.secrets" (include "demo-app.fullname" .) }}
+      {{- if and $awsSecretsEnabled .Values.awsSecretsCSI.objectAlias }}
+        {{- $secretsAlias = .Values.awsSecretsCSI.objectAlias }}
+      {{- end }}
+      {{- if or $awsSecretsEnabled $awsEnvEnabled }}
+      initContainers:
+      {{- if $awsEnvEnabled }}
+      - name: env-secret-creator
+        image: {{ .Values.initImages.kubectl | default "bitnami/kubectl:latest" }}
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            SECRET_NAME="{{ include "demo-app.fullname" . }}-env"
+            ENV_FILE="/mnt/secrets-raw/{{ include "demo-app.fullname" . }}.env"
+
+            echo "Creating K8s Secret '${SECRET_NAME}' from env file..."
+
+            # Detect format: JSON {"KEY":"VALUE",...} or plain text KEY=VALUE
+            if head -c 1 "$ENV_FILE" | grep -q '{'; then
+              echo "Detected JSON format - converting to KEY=VALUE..."
+              awk -F'"' '{for(i=2;i<NF;i+=4) printf "%s=%s\n",$i,$(i+2)}' "$ENV_FILE" > /tmp/env-file
+              ENV_FILE="/tmp/env-file"
+            fi
+
+            kubectl create secret generic "${SECRET_NAME}" \
+              --from-env-file="${ENV_FILE}" \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            echo "✓ Successfully created/updated K8s Secret '${SECRET_NAME}'"
+        volumeMounts:
+          - name: aws-secrets-csi
+            mountPath: /mnt/secrets-raw
+            readOnly: true
+      {{- end }}
+      {{- if $yamlExtractEnabled }}
+      - name: yaml-extractor
+        image: {{ .Values.initImages.yq | default "mikefarah/yq:4" }}
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            echo "Extracting {{ $yamlKey }} from mounted secret..."
+
+            # Extract the specific section, resolve YAML anchors/aliases,
+            # and re-wrap with the environment key so Rails can find it
+            yq eval '{"{{ $yamlKey }}": (.{{ $yamlKey }} | explode(.))}' \
+              /mnt/secrets-raw/{{ $secretsAlias }} \
+              > /mnt/secrets-processed/{{ $yamlOutputFile }}
+
+            echo "✓ Successfully extracted {{ $yamlKey }} configuration to {{ $yamlOutputFile }}"
+        volumeMounts:
+          - name: aws-secrets-csi
+            mountPath: /mnt/secrets-raw
+            readOnly: true
+          - name: secrets-processed
+            mountPath: /mnt/secrets-processed
+      {{- end }}
+      {{- end }}
+      containers:
+      - name: {{ .Chart.Name }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.targetPort }}
+          protocol: TCP
+        env:
+        {{- toYaml .Values.env | nindent 8 }}
+        {{- if $awsEnvEnabled }}
+        envFrom:
+          - secretRef:
+              name: {{ include "demo-app.fullname" . }}-env
+        {{- end }}
+        {{- if and .Values.healthCheck .Values.healthCheck.path }}
+        startupProbe:
+          httpGet:
+            path: {{ .Values.healthCheck.path | default "/health" | quote }}
+            port: {{ .Values.healthCheck.port | default "http" }}
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: {{ .Values.healthCheck.path | default "/health" | quote }}
+            port: {{ .Values.healthCheck.port | default "http" }}
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.healthCheck.path | default "/health" | quote }}
+            port: {{ .Values.healthCheck.port | default "http" }}
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 3
+        {{- else if .Values.startupProbe }}
+        {{- /* Legacy support for old probe format */ -}}
+        startupProbe:
+          {{- toYaml .Values.startupProbe | nindent 10 }}
+        {{- end }}
+        {{- if and (not .Values.healthCheck) .Values.livenessProbe }}
+        {{- /* Legacy support for old probe format */ -}}
+        livenessProbe:
+          {{- toYaml .Values.livenessProbe | nindent 10 }}
+        {{- end }}
+        {{- if and (not .Values.healthCheck) .Values.readinessProbe }}
+        {{- /* Legacy support for old probe format */ -}}
+        readinessProbe:
+          {{- toYaml .Values.readinessProbe | nindent 10 }}
+        {{- end }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+          - name: app-log
+            mountPath: /app/log
+          - name: app-tmp
+            mountPath: /app/tmp
+          {{- if $awsSecretsEnabled }}
+          {{- if $yamlExtractEnabled }}
+          {{/* Mount only the secrets file via subPath to avoid shadowing the entire directory */}}
+          - name: secrets-processed
+            mountPath: "{{ $secretsMountPath }}/{{ $yamlOutputFile }}"
+            subPath: "{{ $yamlOutputFile }}"
+            readOnly: true
+          {{- else }}
+          {{/* Mount only the secrets file via subPath to avoid shadowing the entire directory */}}
+          - name: aws-secrets-csi
+            mountPath: "{{ $secretsMountPath }}/{{ $secretsAlias }}"
+            subPath: "{{ $secretsAlias }}"
+            readOnly: true
+          {{- end }}
+          {{- end }}
+      volumes:
+      - name: app-log
+        emptyDir: {}
+      - name: app-tmp
+        emptyDir: {}
+      {{- if or $awsSecretsEnabled $awsEnvEnabled }}
+      - name: aws-secrets-csi
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: {{ include "demo-app.fullname" . }}-aws-secrets
+      {{- if $yamlExtractEnabled }}
+      {{/* EmptyDir volume for processed secrets from init container */}}
+      - name: secrets-processed
+        emptyDir: {}
+      {{- end }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- if .Values.affinity.podAntiAffinity }}
+        podAntiAffinity:
+          {{- if .Values.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+          {{- range .Values.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution }}
+          - weight: {{ .weight }}
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                  - {{ include "demo-app.name" $ }}
+              topologyKey: {{ .podAffinityTerm.topologyKey }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            {{- toYaml .Values.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution | nindent 10 }}
+          {{- end }}
+        {{- end }}
+        {{- if .Values.affinity.podAffinity }}
+        podAffinity:
+          {{- toYaml .Values.affinity.podAffinity | nindent 10 }}
+        {{- end }}
+        {{- if .Values.affinity.nodeAffinity }}
+        nodeAffinity:
+          {{- toYaml .Values.affinity.nodeAffinity | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+      {{- range .Values.topologySpreadConstraints }}
+      - maxSkew: {{ .maxSkew }}
+        topologyKey: {{ .topologyKey }}
+        whenUnsatisfiable: {{ .whenUnsatisfiable }}
+        labelSelector:
+          matchLabels:
+            {{- include "demo-app.selectorLabels" $ | nindent 12 }}
+      {{- end }}
+      {{- end }}

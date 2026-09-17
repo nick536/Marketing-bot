@@ -1,0 +1,88 @@
+name: Tag Latest (prod)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - k8s/values-prod.yaml
+
+env:
+  APP_NAME: promo-bot
+  RESOURCE_NAME: promo-bot-prod
+  VALUES_FILE: k8s/values-prod.yaml
+  REGISTRY: 000000000000.dkr.ecr.us-east-1.amazonaws.com
+
+jobs:
+  tag-latest:
+    name: Tag Latest Image (prod)
+    runs-on:
+      - promo-bot-prod-runner
+    if: |
+      !contains(github.event.head_commit.message, 'chore: ensure') &&
+      !contains(github.event.head_commit.message, 'chore: add')
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.PROD_AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract image tag from values file
+        id: get_tag
+        run: |
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "Values file not found: $VALUES_FILE"
+            exit 1
+          fi
+          CURRENT_TAG=$(grep -A 3 "^image:" "$VALUES_FILE" | grep "tag:" | awk '{print $2}' | tr -d '"')
+          if [ -z "$CURRENT_TAG" ]; then
+            echo "Could not extract image tag"
+            exit 1
+          fi
+          echo "tag=$CURRENT_TAG" >> $GITHUB_OUTPUT
+
+      - name: Tag image as latest
+        run: |
+          SOURCE_TAG="${{ steps.get_tag.outputs.tag }}"
+          REPO_NAME="$RESOURCE_NAME"
+
+          MANIFEST=$(aws ecr batch-get-image \
+            --repository-name "$REPO_NAME" \
+            --image-ids imageTag="$SOURCE_TAG" \
+            --region us-east-1 \
+            --query 'images[].imageManifest' \
+            --output text)
+
+          if [ -z "$MANIFEST" ]; then
+            echo "Could not find image $REPO_NAME:$SOURCE_TAG"
+            exit 1
+          fi
+
+          aws ecr put-image \
+            --repository-name "$REPO_NAME" \
+            --image-tag "latest" \
+            --image-manifest "$MANIFEST" \
+            --region us-east-1 || {
+              aws ecr batch-delete-image \
+                --repository-name "$REPO_NAME" \
+                --image-ids imageTag=latest \
+                --region us-east-1
+              aws ecr put-image \
+                --repository-name "$REPO_NAME" \
+                --image-tag "latest" \
+                --image-manifest "$MANIFEST" \
+                --region us-east-1
+            }

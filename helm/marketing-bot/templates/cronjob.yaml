@@ -1,0 +1,94 @@
+{{- range $name, $job := .Values.cronJobs }}
+{{- if $job.enabled }}
+{{- $awsEnvEnabled := and $.Values.awsEnvSecret (hasKey $.Values.awsEnvSecret "enabled") $.Values.awsEnvSecret.enabled -}}
+{{- $awsSecretsEnabled := and $.Values.awsSecretsCSI (hasKey $.Values.awsSecretsCSI "enabled") $.Values.awsSecretsCSI.enabled -}}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "demo-app.fullname" $ }}-{{ $name }}
+  labels:
+    {{- include "demo-app.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: cronjob
+spec:
+  schedule: {{ $job.schedule | quote }}
+  concurrencyPolicy: {{ $job.concurrencyPolicy | default "Forbid" }}
+  successfulJobsHistoryLimit: {{ $job.successfulJobsHistoryLimit | default 3 }}
+  failedJobsHistoryLimit: {{ $job.failedJobsHistoryLimit | default 3 }}
+  startingDeadlineSeconds: {{ $job.startingDeadlineSeconds | default 300 }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ $job.backoffLimit | default 1 }}
+      activeDeadlineSeconds: {{ $job.activeDeadlineSeconds | default 600 }}
+      template:
+        metadata:
+          labels:
+            {{- include "demo-app.selectorLabels" $ | nindent 12 }}
+            app.kubernetes.io/component: cronjob
+            cronjob-name: {{ $name }}
+        spec:
+          restartPolicy: {{ $job.restartPolicy | default "OnFailure" }}
+          serviceAccountName: {{ include "demo-app.serviceAccountName" $ }}
+          {{- with $.Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $awsEnvEnabled }}
+          initContainers:
+          - name: env-secret-creator
+            image: {{ $.Values.initImages.kubectl | default "bitnami/kubectl:latest" }}
+            command: ["/bin/sh", "-c"]
+            args:
+              - |
+                set -e
+                SECRET_NAME="{{ include "demo-app.fullname" $ }}-env"
+                ENV_FILE="/mnt/secrets-raw/{{ include "demo-app.fullname" $ }}.env"
+
+                echo "Creating K8s Secret '${SECRET_NAME}' from env file..."
+
+                if head -c 1 "$ENV_FILE" | grep -q '{'; then
+                  echo "Detected JSON format - converting to KEY=VALUE..."
+                  awk -F'"' '{for(i=2;i<NF;i+=4) printf "%s=%s\n",$i,$(i+2)}' "$ENV_FILE" > /tmp/env-file
+                  ENV_FILE="/tmp/env-file"
+                fi
+
+                kubectl create secret generic "${SECRET_NAME}" \
+                  --from-env-file="${ENV_FILE}" \
+                  --dry-run=client -o yaml | kubectl apply -f -
+
+                echo "✓ Successfully created/updated K8s Secret '${SECRET_NAME}'"
+            volumeMounts:
+              - name: aws-secrets-csi
+                mountPath: /mnt/secrets-raw
+                readOnly: true
+          {{- end }}
+          containers:
+          - name: {{ $name }}
+            image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+            imagePullPolicy: {{ $.Values.image.pullPolicy }}
+            command: {{ toJson $job.command }}
+            args: {{ toJson $job.args }}
+            env:
+            {{- toYaml $.Values.env | nindent 12 }}
+            {{- if $awsEnvEnabled }}
+            envFrom:
+              - secretRef:
+                  name: {{ include "demo-app.fullname" $ }}-env
+            {{- end }}
+            resources:
+              {{- toYaml ($job.resources | default $.Values.resources) | nindent 14 }}
+          {{- if $awsEnvEnabled }}
+          volumes:
+            - name: aws-secrets-csi
+              csi:
+                driver: secrets-store.csi.k8s.io
+                readOnly: true
+                volumeAttributes:
+                  secretProviderClass: {{ include "demo-app.fullname" $ }}-aws-secrets
+          {{- end }}
+---
+{{- end }}
+{{- end }}

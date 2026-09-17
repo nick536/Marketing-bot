@@ -1,0 +1,66 @@
+nameOverride: "promo-bot-prod"
+fullnameOverride: "promo-bot-prod"
+
+replicaCount: 1
+
+image:
+  repository: 000000000000.dkr.ecr.us-east-1.amazonaws.com/promo-bot-prod
+  pullPolicy: Always
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+
+ingress:
+  enabled: true
+  ingressClassName: ingress-nginx-prod
+  hosts:
+    - host: promo-bot-prod.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+serviceAccount:
+  create: true
+  name: "promo-bot-prod"
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::000000000000:role/promo-bot-prod"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+nodeSelector:
+  kubernetes.io/arch: arm64
+
+healthCheck:
+  path: /health
+  port: 8000
+
+awsSecretsCSI:
+  enabled: true
+
+# Daily reminder + reconcile cron. Runs app.reminders_cron which:
+#   - reconciles missed approvals from Approver-approvals channel
+#   - backfills calendar-keeper FYIs for newly-approved promos
+#   - chases actuals from POCs whose promos ended ≥7d ago
+#     (skips Marketing Type in {Pos, Display, Displays, Training})
+cronJobs:
+  reminders:
+    # DISABLED 2026-05-22 — duplicate scheduler. The sole owner of the
+    # reminder sweep is the CronJob in k8s/values-prod.yaml (0 9 * * *).
+    # Enabling this one re-introduces a double-send of every actuals
+    # chase (~9 AM IST here + 2:30 PM IST there). Do NOT re-enable.
+    enabled: false
+    schedule: "30 3 * * *"     # 09:00 IST daily (UTC 03:30)
+    concurrencyPolicy: Forbid
+    restartPolicy: OnFailure
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    command: ["python", "-m", "app.reminders_cron"]

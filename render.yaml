@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: marketing-approval-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: PROMO_CHANNEL_ID
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: PROMO_SHEET_ID
+        value: REDACTED_SHEET_ID_2
+      - key: SELLOUT_SHEET_ID
+        value: REDACTED_SHEET_ID_4
+      - key: METABASE_URL
+        value: https://metabase.example.com
+      - key: METABASE_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DATA_API_TOKEN
+        sync: false
+      - key: DATA_API_URL
+        value: https://data-api.example.com/data/api/v1/data/execute-sql

@@ -1,0 +1,237 @@
+# Default values for demo-app
+# Optimized for EKS 1.33+ with internal services via nginx-ingress
+
+replicaCount: 2
+
+image:
+  repository: arn:aws:ecr:us-east-1:000000000000:repository/demo-app  # Update with your ECR registry (e.g., account-id.dkr.ecr.region.amazonaws.com/demo-app)
+  pullPolicy: Always
+  tag: "latest"  # This will be overridden by CI/CD
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# AWS EKS specific configurations
+eks:
+  # IRSA (IAM Roles for Service Accounts) annotations for AWS service access
+  serviceAccount:
+    annotations:
+      # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/demo-app-role
+  # Enable if you need AWS VPC CNI security groups for pods
+  enableSecurityGroupForPods: false
+
+serviceAccount:
+  create: true
+  # IRSA annotations for AWS Secrets Manager CSI Driver
+  # Required permissions for awsSecretsCSI:
+  #   - secretsmanager:GetSecretValue
+  #   - secretsmanager:DescribeSecret
+  # Example IAM role: arn:aws:iam::000000000000:role/demo-app-secrets-role
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/demo-app-secrets-role
+  name: ""
+
+podAnnotations: {}
+
+# Enhanced Pod Security Standards (PSS) - restricted profile
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1001
+  fsGroup: 1001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1001
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+# Nginx Ingress for internal routing
+# cert-manager is integrated by default - all ingresses get TLS certificates automatically
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  annotations: {}
+  hosts:
+    - host: demo-app.internal.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Horizontal Pod Autoscaler with advanced behavior for EKS 1.33+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # Behavior configuration for predictable scaling
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 15
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 2
+        periodSeconds: 15
+      selectPolicy: Max
+
+# Health check configuration
+# Only customize the path and port per application
+# Probe timing settings are defined in the deployment template with sensible defaults
+# Note: Health checks use HTTP internally (container port), not HTTPS
+# HTTPS/TLS termination happens at the ingress level via cert-manager
+healthCheck:
+  path: /health
+  port: http  # Uses service.targetPort (HTTP, not HTTPS)
+
+# Legacy probe configuration (for backward compatibility)
+# New deployments should use healthCheck above instead
+# startupProbe: {}
+# livenessProbe: {}
+# readinessProbe: {}
+
+# Pod Disruption Budget for high availability
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Topology Spread Constraints for better pod distribution across AZs
+# labelSelector is automatically set to match the app's selector labels
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+
+# Node selector for specific node groups or instance types
+nodeSelector: {}
+  # eks.amazonaws.com/nodegroup: application-nodes
+  # node.kubernetes.io/instance-type: t3.medium
+
+# Tolerations for spot instances or tainted nodes
+tolerations: []
+  # - key: "spot"
+  #   operator: "Equal"
+  #   value: "true"
+  #   effect: "NoSchedule"
+
+# Pod anti-affinity for better availability across nodes
+# labelSelector is automatically set to match the app's selector labels
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+    - weight: 100
+      podAffinityTerm:
+        topologyKey: kubernetes.io/hostname
+
+# Network Policy for additional security (enable if using Calico or Cilium)
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: ingress-nginx
+      ports:
+      - protocol: TCP
+        port: 3000
+  egress:
+    - to:
+      - namespaceSelector: {}
+      ports:
+      - protocol: TCP
+        port: 443
+      - protocol: TCP
+        port: 80
+
+# Priority class for pod scheduling priority
+priorityClassName: ""
+
+# Service Monitor for Prometheus metrics (if using Prometheus Operator)
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  path: /metrics
+
+env:
+  - name: NODE_ENV
+    value: "production"
+  - name: PORT
+    value: "3000"
+
+# ConfigMap for additional configuration
+configMap:
+  enabled: false
+  data: {}
+
+# Secrets for sensitive data
+secrets:
+  enabled: false
+  data: {}
+
+# Persistent storage (if needed)
+persistence:
+  enabled: false
+  storageClass: "gp3"  # EKS gp3 for better performance
+  accessMode: ReadWriteOnce
+  size: 1Gi
+
+# AWS Secrets Manager CSI Driver (convention-based)
+# Mounts secrets directly from AWS Secrets Manager into pods using CSI driver
+# No secrets stored in Kubernetes - fetched at pod startup from AWS Secrets Manager
+#
+# Prerequisites:
+#   1. AWS Secrets Manager CSI Driver installed in cluster
+#   2. Service account with IRSA role having secretsmanager:GetSecretValue permission
+#   3. Secret must exist in AWS Secrets Manager
+#
+# Convention (all derived from envPrefix + app fullname in templates):
+#   - Secret name: <envPrefix>/<fullname>.secrets (e.g., prod/my-app.secrets)
+#   - Object alias: <fullname>.secrets
+#   - Mount path: /app/config/database.yml
+#   - yamlExtract key: prod→production, staging→staging, dev→development
+#   - yamlExtract output: database.yml
+#
+# Only set enabled + envPrefix in app-specific values.
+# Override secretName, mountPath, objectAlias, yamlExtract.key/outputFile only if needed.
+awsSecretsCSI:
+  enabled: false
+
+# AWS Secrets Manager env file integration (convention-based)
+# Loads <envPrefix>/<fullname>.env from AWS Secrets Manager as container env vars
+# Supports both plain text KEY=VALUE and JSON {"KEY":"VALUE"} formats
+awsEnvSecret:
+  enabled: false

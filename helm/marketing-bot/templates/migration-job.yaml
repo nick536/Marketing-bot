@@ -1,0 +1,106 @@
+{{- if .Values.migrations }}
+{{- if .Values.migrations.enabled }}
+{{- $awsSecretsEnabled := and .Values.awsSecretsCSI (hasKey .Values.awsSecretsCSI "enabled") .Values.awsSecretsCSI.enabled -}}
+{{- $envPrefix := "prod" -}}
+{{- if $awsSecretsEnabled -}}
+  {{- $envPrefix = .Values.awsSecretsCSI.envPrefix | default "prod" -}}
+{{- end -}}
+{{- $secretsAlias := printf "%s.secrets" (include "demo-app.fullname" .) -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "demo-app.fullname" . }}-migrate-{{ .Values.image.tag | default "latest" }}
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ .Values.migrations.timeoutSeconds | default 600 }}
+  template:
+    metadata:
+      labels:
+        {{- include "demo-app.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migration
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "demo-app.serviceAccountName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        {{- if $awsSecretsEnabled }}
+        - name: aws-secrets-csi
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "demo-app.fullname" . }}-aws-secrets
+        {{- end }}
+        - name: secrets-processed
+          emptyDir: {}
+      initContainers:
+        {{- if $awsSecretsEnabled }}
+        - name: yaml-extractor
+          image: {{ .Values.initImages.yq | default "mikefarah/yq:4" }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "Extracting production from mounted secret..."
+              yq eval '{"production": (.production | explode(.))}' \
+                /mnt/secrets-raw/{{ $secretsAlias }} \
+                > /mnt/secrets-processed/database.yml
+              echo "✓ Successfully extracted production configuration to database.yml"
+          volumeMounts:
+            - name: aws-secrets-csi
+              mountPath: /mnt/secrets-raw
+              readOnly: true
+            - name: secrets-processed
+              mountPath: /mnt/secrets-processed
+        {{- end }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              echo "=== Copying database.yml ==="
+              cp /mnt/secrets-processed/database.yml /app/config/database.yml
+
+              {{- range .Values.migrations.tasks }}
+              echo "=== Running: {{ . }} ==="
+              bundle exec rails {{ . }}
+              echo "✓ {{ . }} completed"
+              {{- end }}
+
+              echo "=== All migrations completed ==="
+          env:
+            - name: RAILS_ENV
+              value: "production"
+            - name: GEO_REGION
+              value: {{ .Values.migrations.geoRegion | default "global" | quote }}
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: secrets-processed
+              mountPath: /mnt/secrets-processed
+              readOnly: true
+{{- end }}
+{{- end }}

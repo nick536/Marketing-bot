@@ -1,0 +1,395 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - release
+      - develop
+
+env:
+  APP_NAME: promo-bot
+  PROD_BRANCH: refs/heads/release
+  STAGING_BRANCH: refs/heads/develop
+  VALUES_DIR: k8s
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on:
+      - ${{ github.ref == 'refs/heads/release' && 'promo-bot-prod-runner' || 'promo-bot-staging-runner' }}
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      !contains(github.event.head_commit.message, 'update image tag to')
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set environment variables based on branch
+        id: set_env
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/release" ]; then
+            echo "ENV_NAME=prod" >> $GITHUB_OUTPUT
+            echo "ACCOUNT_ID=000000000000" >> $GITHUB_OUTPUT
+            echo "YAML_EXTRACT_KEY=production" >> $GITHUB_OUTPUT
+            echo "Deploying to PRODUCTION environment"
+          elif [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+            echo "ACCOUNT_ID=111111111111" >> $GITHUB_OUTPUT
+            echo "YAML_EXTRACT_KEY=staging" >> $GITHUB_OUTPUT
+            echo "Deploying to STAGING environment"
+          else
+            echo "Unknown branch: $GITHUB_REF"
+            exit 1
+          fi
+
+          if [ "$GITHUB_REF" = "refs/heads/release" ]; then
+            ACCT="000000000000"
+            ENV="prod"
+          else
+            ACCT="111111111111"
+            ENV="staging"
+          fi
+          RESOURCE_NAME="promo-bot-$ENV"
+          echo "RESOURCE_NAME=$RESOURCE_NAME" >> $GITHUB_OUTPUT
+          echo "REGISTRY=$ACCT.dkr.ecr.us-east-1.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "IMAGE_NAME=$ACCT.dkr.ecr.us-east-1.amazonaws.com/$RESOURCE_NAME" >> $GITHUB_OUTPUT
+          echo "VALUES_FILE=k8s/values-$ENV.yaml" >> $GITHUB_OUTPUT
+
+      - name: Add Git metadata to env file
+        run: |
+          ENV_FILE="${{ steps.set_env.outputs.ENV_NAME }}.env"
+          if [ -f "$ENV_FILE" ]; then
+            GIT_SHA=$(git rev-parse --short=8 HEAD)
+            GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD | sed 's/[^a-zA-Z0-9._-]/-/g')
+            BUILD_TIME=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+            echo "" >> "$ENV_FILE"
+            echo "GIT_SHA=$GIT_SHA" >> "$ENV_FILE"
+            echo "GIT_BRANCH=$GIT_BRANCH" >> "$ENV_FILE"
+            echo "BUILD_TIME=$BUILD_TIME" >> "$ENV_FILE"
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.ref == 'refs/heads/release' && secrets.PROD_AWS_ROLE_ARN || secrets.STAGE_AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Fetch secrets from AWS Secrets Manager (for Docker build)
+        run: |
+          ENV_NAME="${{ steps.set_env.outputs.ENV_NAME }}"
+          ENV_FILE="$ENV_NAME.env"
+          if [ -f "$ENV_FILE" ]; then
+            SECRET_NAME="$ENV_NAME/promo-bot.env"
+            if aws secretsmanager get-secret-value --secret-id "$SECRET_NAME" --query SecretString --output text > env.secrets 2>/dev/null; then
+              if jq -e . >/dev/null 2>&1 < env.secrets; then
+                echo "" >> "$ENV_FILE"
+                jq -r 'to_entries | .[] | "\(.key)=\(.value)"' env.secrets >> "$ENV_FILE"
+              else
+                echo "" >> "$ENV_FILE"
+                cat env.secrets >> "$ENV_FILE"
+              fi
+              rm -f env.secrets
+            fi
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        env:
+          DOCKER_API_VERSION: "1.43"
+        with:
+          driver: docker-container
+          driver-opts: image=moby/buildkit:v0.12.0
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate version tag
+        id: version
+        run: |
+          VERSION_COUNT=$(git rev-list --count HEAD)
+          SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)
+          VERSION_TAG="v$VERSION_COUNT-$SHORT_SHA"
+          echo "tag=$VERSION_TAG" >> $GITHUB_OUTPUT
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.set_env.outputs.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.tag }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/release' }}
+
+      # SECURITY NOTE: injecting runtime secrets as Docker build args leaks them
+      # into image metadata (`docker history`). Kept for reference only; prefer
+      # runtime secret injection in any real deployment.
+      - name: Generate Docker build args from env file
+        id: build_args
+        run: |
+          ENV_FILE="${{ steps.set_env.outputs.ENV_NAME }}.env"
+          BUILD_ARGS="AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"$'\n'"AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"$'\n'"AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
+          if [ -f "$ENV_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [[ ! "$line" =~ ^[[:space:]]*$ ]] && [[ ! "$line" =~ ^[[:space:]]*# ]]; then
+                if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                  echo "::add-mask::${BASH_REMATCH[2]}"
+                  BUILD_ARGS="$BUILD_ARGS"$'\n'"${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+                fi
+              fi
+            done < "$ENV_FILE"
+          fi
+          echo "build_args<<EOF" >> $GITHUB_OUTPUT
+          echo "$BUILD_ARGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        env:
+          DOCKER_API_VERSION: "1.43"
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ steps.build_args.outputs.build_args }}
+
+      - name: Cleanup secrets from env file
+        if: always()
+        run: |
+          ENV_FILE="${{ steps.set_env.outputs.ENV_NAME }}.env"
+          if [ -f "$ENV_FILE" ]; then
+            git checkout -- "$ENV_FILE" 2>/dev/null || true
+          fi
+          rm -f env.secrets 2>/dev/null || true
+
+  update-values:
+    name: Update k8s/values.yaml
+    needs: build-and-push
+    runs-on:
+      - ${{ github.ref == 'refs/heads/release' && 'promo-bot-prod-runner' || 'promo-bot-staging-runner' }}
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/release' || github.ref == 'refs/heads/develop')
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set environment variables based on branch
+        id: set_env
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/release" ]; then
+            echo "ENV_NAME=prod" >> $GITHUB_OUTPUT
+            echo "ACCOUNT_ID=000000000000" >> $GITHUB_OUTPUT
+            echo "YAML_EXTRACT_KEY=production" >> $GITHUB_OUTPUT
+            echo "TARGET_BRANCH=main" >> $GITHUB_OUTPUT
+          elif [ "$GITHUB_REF" = "refs/heads/develop" ]; then
+            echo "ENV_NAME=staging" >> $GITHUB_OUTPUT
+            echo "ACCOUNT_ID=111111111111" >> $GITHUB_OUTPUT
+            echo "YAML_EXTRACT_KEY=staging" >> $GITHUB_OUTPUT
+            echo "TARGET_BRANCH=develop-main" >> $GITHUB_OUTPUT
+          fi
+          if [ "$GITHUB_REF" = "refs/heads/release" ]; then
+            ACCT="000000000000"
+            ENV="prod"
+          else
+            ACCT="111111111111"
+            ENV="staging"
+          fi
+          RESOURCE_NAME="promo-bot-$ENV"
+          echo "RESOURCE_NAME=$RESOURCE_NAME" >> $GITHUB_OUTPUT
+          echo "REGISTRY=$ACCT.dkr.ecr.us-east-1.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "VALUES_FILE=k8s/values-$ENV.yaml" >> $GITHUB_OUTPUT
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ github.ref == 'refs/heads/release' && secrets.PROD_AWS_ROLE_ARN || secrets.STAGE_AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Check runtime secrets exist
+        id: check_secrets
+        run: |
+          ENV_NAME="${{ steps.set_env.outputs.ENV_NAME }}"
+          SECRET_NAME="$ENV_NAME/promo-bot.secrets"
+          if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" >/dev/null 2>&1; then
+            echo "secrets_exist=true" >> $GITHUB_OUTPUT
+            echo "secret_name=$SECRET_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "secrets_exist=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install yq
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            YQ_BINARY="yq_linux_arm64"
+          else
+            YQ_BINARY="yq_linux_amd64"
+          fi
+          sudo wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/latest/download/$YQ_BINARY"
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Ensure values file exists on target branch
+        run: |
+          TARGET="${{ steps.set_env.outputs.TARGET_BRANCH }}"
+          VALUES_FILE="${{ steps.set_env.outputs.VALUES_FILE }}"
+          git fetch origin "$TARGET" 2>/dev/null || true
+          git checkout "$TARGET" 2>/dev/null || git checkout -b "$TARGET"
+          git pull origin "$TARGET" 2>/dev/null || true
+          mkdir -p k8s
+          if [ ! -f "$VALUES_FILE" ]; then
+            REGISTRY="${{ steps.set_env.outputs.REGISTRY }}"
+            RESOURCE_NAME="${{ steps.set_env.outputs.RESOURCE_NAME }}"
+            cat > "$VALUES_FILE" <<EOF
+          nameOverride: "$RESOURCE_NAME"
+          fullnameOverride: "$RESOURCE_NAME"
+          replicaCount: 1
+          image:
+            repository: $REGISTRY/$RESOURCE_NAME
+            pullPolicy: Always
+            tag: "latest"
+          service:
+            type: ClusterIP
+            port: 80
+            targetPort: 3000
+          EOF
+            git add "$VALUES_FILE"
+            git commit -m "chore: ensure $VALUES_FILE exists on $TARGET"
+            git push origin "$TARGET"
+          fi
+
+      - name: Switch to source branch and sync with target
+        run: |
+          SOURCE="$GITHUB_REF_NAME"
+          TARGET="${{ steps.set_env.outputs.TARGET_BRANCH }}"
+          git checkout "$SOURCE"
+          git pull origin "$SOURCE" || true
+          if git merge "origin/$TARGET" --no-commit --no-ff 2>/dev/null; then
+            echo "Merged $TARGET into $SOURCE"
+          else
+            if git merge-base --is-ancestor "origin/$TARGET" HEAD; then
+              echo "$SOURCE is already up to date with $TARGET"
+            else
+              git merge --abort 2>/dev/null || true
+            fi
+          fi
+
+      - name: Update image tag
+        run: |
+          VALUES_FILE="${{ steps.set_env.outputs.VALUES_FILE }}"
+          NEW_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          yq eval ".image.tag = \"$NEW_TAG\"" -i "$VALUES_FILE"
+          echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+
+      - name: Update AWS Secrets CSI configuration
+        run: |
+          VALUES_FILE="${{ steps.set_env.outputs.VALUES_FILE }}"
+          YAML_EXTRACT_KEY="${{ steps.set_env.outputs.YAML_EXTRACT_KEY }}"
+          if yq eval 'has("awsSecretsCSI")' "$VALUES_FILE" | grep -q "true"; then
+            if [ "${{ steps.check_secrets.outputs.secrets_exist }}" = "true" ]; then
+              SECRET_NAME="${{ steps.check_secrets.outputs.secret_name }}"
+              yq eval ".awsSecretsCSI.enabled = true" -i "$VALUES_FILE"
+              yq eval ".awsSecretsCSI.secretName = \"$SECRET_NAME\"" -i "$VALUES_FILE"
+              yq eval ".awsSecretsCSI.mountPath = \"/app/config\"" -i "$VALUES_FILE"
+              yq eval ".awsSecretsCSI.objectAlias = \"promo-bot.secrets\"" -i "$VALUES_FILE"
+            else
+              yq eval ".awsSecretsCSI.enabled = false" -i "$VALUES_FILE"
+            fi
+          fi
+
+      - name: Merge root values.yaml if exists
+        run: |
+          VALUES_FILE="${{ steps.set_env.outputs.VALUES_FILE }}"
+          TARGET="${{ steps.set_env.outputs.TARGET_BRANCH }}"
+          if git show "origin/$TARGET":values.yaml > /tmp/root-values.yaml 2>/dev/null; then
+            yq eval-all 'select(fileIndex == 0) * select(fileIndex == 1)' \
+              "$VALUES_FILE" /tmp/root-values.yaml > "$VALUES_FILE.tmp"
+            if [ $? -eq 0 ] && [ -s "$VALUES_FILE.tmp" ]; then
+              mv "$VALUES_FILE.tmp" "$VALUES_FILE"
+            else
+              rm -f "$VALUES_FILE.tmp"
+            fi
+            rm -f /tmp/root-values.yaml
+          fi
+
+      - name: Commit and push
+        id: commit
+        run: |
+          VALUES_FILE="${{ steps.set_env.outputs.VALUES_FILE }}"
+          git add "$VALUES_FILE"
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          git commit -m "chore(promo-bot): update image tag to $NEW_TAG"
+          git push origin "$GITHUB_REF_NAME"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+
+      - name: Check for existing PR
+        if: steps.commit.outputs.has_changes == 'true'
+        id: check_pr
+        run: |
+          TARGET="${{ steps.set_env.outputs.TARGET_BRANCH }}"
+          SOURCE="$GITHUB_REF_NAME"
+          EXISTING_PR=$(gh pr list --base "$TARGET" --head "$SOURCE" --state open --json number --jq '.[0].number' || echo "")
+          if [ -n "$EXISTING_PR" ]; then
+            echo "pr_exists=true" >> $GITHUB_OUTPUT
+            echo "pr_number=$EXISTING_PR" >> $GITHUB_OUTPUT
+          else
+            echo "pr_exists=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Create Pull Request
+        if: steps.commit.outputs.has_changes == 'true' && steps.check_pr.outputs.pr_exists == 'false'
+        run: |
+          TARGET="${{ steps.set_env.outputs.TARGET_BRANCH }}"
+          SOURCE="$GITHUB_REF_NAME"
+          gh label create "automated" --color "0E8A16" 2>/dev/null || true
+          gh label create "helm-values" --color "1D76DB" 2>/dev/null || true
+          gh pr create \
+            --base "$TARGET" \
+            --head "$SOURCE" \
+            --title "chore: Update values for promo-bot" \
+            --body "## Automated Values Update
+
+          Image Tag: \`$NEW_TAG\`
+          Commit: \`$GITHUB_SHA\`
+          Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Auto-generated by CI/CD pipeline." \
+            --label "automated" \
+            --label "helm-values"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Update existing PR
+        if: steps.commit.outputs.has_changes == 'true' && steps.check_pr.outputs.pr_exists == 'true'
+        run: |
+          gh pr comment ${{ steps.check_pr.outputs.pr_number }} --body "## Automated Update
+          - **Image Tag**: \`$NEW_TAG\`
+          - **Commit**: \`$GITHUB_SHA\`"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}

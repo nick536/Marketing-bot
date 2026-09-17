@@ -1,0 +1,16 @@
+{{- if and .Values.serviceMonitor (hasKey .Values.serviceMonitor "enabled") .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "demo-app.fullname" . }}
+  labels:
+    {{- include "demo-app.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "demo-app.selectorLabels" . | nindent 6 }}
+  endpoints:
+  - port: http
+    interval: {{ .Values.serviceMonitor.interval }}
+    path: {{ .Values.serviceMonitor.path }}
+{{- end }}

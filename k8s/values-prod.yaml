@@ -1,0 +1,84 @@
+nameOverride: "promo-bot-prod"
+fullnameOverride: "promo-bot-prod"
+replicaCount: 1
+image:
+  repository: 000000000000.dkr.ecr.us-east-1.amazonaws.com/promo-bot-prod
+  pullPolicy: Always
+  tag: "v479-3f4548e"
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8000
+ingress:
+  enabled: true
+  ingressClassName: nginx
+  annotations: {}
+  hosts:
+    - host: promo-bot.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+autoscaling:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+healthCheck:
+  path: /health
+  port: http
+env:
+  - name: ENVIRONMENT
+    value: "production"
+  - name: APP_NAME
+    value: "promo-bot"
+  - name: APPROVER_APPROVALS_CHANNEL_ID
+    value: "C0REDACT002"
+serviceAccount:
+  create: true
+  name: "promo-bot-prod"
+  annotations:
+    eks.amazonaws.com/role-arn: "arn:aws:iam::000000000000:role/promo-bot-prod"
+nodeSelector:
+  kubernetes.io/arch: arm64
+tolerations:
+  - key: arch
+    operator: Equal
+    value: arm64
+    effect: NoSchedule
+awsSecretsCSI:
+  enabled: true
+  secretName: prod/promo-bot.secrets
+  mountPath: /app/config
+  objectAlias: promo-bot.secrets
+  yamlExtract:
+    enabled: false
+awsEnvSecret:
+  enabled: true
+  envPrefix: "prod"
+  secretName: "prod/promo-bot.env"
+initImages:
+  kubectl: "000000000000.dkr.ecr.us-east-1.amazonaws.com/init-images/kubectl:latest"
+  yq: "000000000000.dkr.ecr.us-east-1.amazonaws.com/init-images/yq:4"
+cronJobs:
+  reminders:
+    # SOLE scheduler for the daily reminder sweep as of 2026-05-22. The
+    # Jenkins 'promo-bot reminders' pipeline was deleted that day — it
+    # and this CronJob both ran `python -m app.reminders_cron`, double-
+    # sending every actuals chase ~33 min apart (09:00 vs 09:33 UTC).
+    # This is now the only owner; the duplicate in
+    # helm/marketing-bot/values-promo-bot.yaml stays disabled. Before adding
+    # any other scheduler, disable this one. Fires 09:00 UTC = 2:30 PM IST.
+    enabled: true
+    schedule: "0 9 * * *"
+    command: ["python", "-m", "app.reminders_cron"]
+    args: []
+    activeDeadlineSeconds: 900
